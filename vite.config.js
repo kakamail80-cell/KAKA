@@ -25,7 +25,9 @@ const devSave = () => ({
 
 // `npm run dev`       → http://localhost:5173 (PC 파일 테스트용)
 // `npm run dev:phone` → https://<PC IP>:5173 (같은 와이파이의 폰에서 카메라 사용)
-export default defineConfig(({ mode }) => ({
+export default defineConfig(({ mode, command, isPreview }) => ({
+  // GitHub Pages: https://kakamail80-cell.github.io/KAKA/
+  base: command === 'build' || isPreview ? '/KAKA/' : '/',
   plugins: [
     react(),
     devSave(),
@@ -44,6 +46,18 @@ export default defineConfig(({ mode }) => ({
       workbox: {
         globPatterns: ['**/*.{js,css,html,svg,wasm,gz}'],
         maximumFileSizeToCacheInBytes: 30 * 1024 * 1024,
+        // OCR 엔진(tesseract 코어·학습데이터)은 CDN에서 받으므로 한 번 받은 뒤 태블릿에 보관
+        runtimeCaching: [
+          {
+            urlPattern: /^https:\/\/(cdn\.jsdelivr\.net|unpkg\.com|tessdata\.projectnaptha\.com)\//,
+            handler: 'CacheFirst',
+            options: {
+              cacheName: 'ocr-engine',
+              expiration: { maxEntries: 30, maxAgeSeconds: 60 * 60 * 24 * 365 },
+              cacheableResponse: { statuses: [0, 200] },
+            },
+          },
+        ],
       },
     }),
   ].filter(Boolean),
