@@ -1,16 +1,32 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { grabFrame, processFrame } from './lib/pipeline.js'
-import { initOcr, setPanels } from './lib/ocr.js'
+import { initOcr, readLabels, setPanels } from './lib/ocr.js'
 import { exportZip, getShot, loadSession, saveSession, saveShot } from './lib/store.js'
 import { readTargets, writeStock } from './lib/excel.js'
 import { buildRoute, locate } from './lib/route.js'
 import { countItems, extractCell } from './lib/count.js'
+import { driftFromReads, photoGridToVideo, trackFrame, TRACK_PARAMS } from './lib/track.js'
 
 const REF_VIDEO = '/참고/재고칸_인식테스트_영상.mp4'
-const STREAK_NEEDED = 4 // 대상 라벨이 연속 N프레임 인식되면 촬영
-const MIN_W_RATIO = 0.05 // 라벨 폭 ≥ 화면 폭 5% (확대 상태, 화면에 칸 7~8열 정도)
 // 촬영 사진 크롭 범위 (격자 한 칸 간격 기준, 라벨 중심에서)
 const CELL_CROP = { side: 0.6, up: 1.0, down: 0.3 }
+// 가운데 고정 촬영 프레임 (화면 대비 비율). 사람이 먼저 찾은 칸을 여기에 맞춰 찍으면 그 칸을 저장
+const CENTER_FRAME = { w: 0.26, cellAspect: 0.56 } // 폭 = 화면의 26%, 높이 = 폭 × 칸 세로/가로 비(실측 0.54~0.59)
+const frameH = (vw, vh) => CENTER_FRAME.w * (vw / vh) * CENTER_FRAME.cellAspect
+const VERIFY_MS = 600 // 추적 중 OCR로 밀림 확인 주기
+const VERIFY_N = 4 // 확인할 라벨 수 (화면 중앙 가까운 순)
+const RESOLUTIONS = {
+  '4k': { label: '4K', w: 3840, h: 2160 },
+  fhd: { label: 'FHD', w: 1920, h: 1080 },
+  hd: { label: 'HD', w: 1280, h: 720 },
+}
+const loadRes = () => {
+  try {
+    const r = localStorage.getItem('resolution')
+    if (RESOLUTIONS[r]) return r
+  } catch {}
+  return 'fhd'
+}
 
 const CELL_RE = /([A-Z])-(\d{1,2})-(\d{1,2})/g
 const parseCells = (text) => [
@@ -69,16 +85,16 @@ function drawOverlay(canvas, res, stop, loc, hit, ahead = []) {
   // 1) 연결선: 화면 중앙 → 현재 대상 → 다음 대상들 (화면 밖이면 선이 가장자리로 이어져 방향을 알려줌)
   const pts = [{ x: w / 2, y: h / 2 }, { x: cur.cx, y: cur.cy }]
   for (const a of ahead) pts.push({ x: a.loc.x, y: a.loc.y - a.loc.pitchY * 0.2 })
+  // 모든 구간을 같은 녹색 점선으로 (어두운 테두리를 먼저 그려 밝은 배경에서도 보이게)
   ctx.lineCap = 'round'
   ctx.lineJoin = 'round'
-  for (let i = pts.length - 1; i >= 1; i--) {
-    const main = i === 1
-    ctx.strokeStyle = main ? colorOf(stop) : 'rgba(255,255,255,.55)'
-    ctx.lineWidth = (main ? 7 : 4) * u
-    ctx.setLineDash(main ? [] : [14 * u, 10 * u])
+  ctx.setLineDash([16 * u, 11 * u])
+  for (const [color, width] of [['rgba(0,0,0,.45)', 7], ['#22ff55', 4]]) {
+    ctx.strokeStyle = color
+    ctx.lineWidth = width * u
     ctx.beginPath()
-    ctx.moveTo(pts[i - 1].x, pts[i - 1].y)
-    ctx.lineTo(pts[i].x, pts[i].y)
+    ctx.moveTo(pts[0].x, pts[0].y)
+    for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y)
     ctx.stroke()
   }
   ctx.setLineDash([])
@@ -145,13 +161,24 @@ export default function App() {
   const overlayRef = useRef(null)
   const stageRef = useRef(null)
   const runRef = useRef({ token: 0 })
-  const streakRef = useRef({}) // 칸별 연속 인식 프레임 수
   const sessionRef = useRef(emptySession())
   const modalRef = useRef(null)
   const stepRef = useRef(0.2)
   const modeRef = useRef('idle')
   const flashRef = useRef(null)
   const guideRef = useRef(null)
+  const trackRef = useRef({ grid: null, lost: 0, lastVerify: 0, verifying: false, avgBoxes: 0, blur: 0 })
+  const busyRef = useRef(false)
+  const autoConfirmRef = useRef(false) // 시연 녹화 시 개수 창 없이 자동 기록
+  const [busy, setBusy] = useState(false)
+  const [resolution, setResolution] = useState(loadRes())
+  const changeResolution = (k) => {
+    setResolution(k)
+    try {
+      localStorage.setItem('resolution', k)
+    } catch {}
+    if (modeRef.current === 'camera') startCamera(k)
+  }
 
   const [session, setSessionState] = useState(emptySession())
   const [mode, setModeState] = useState('idle') // idle | file | camera
@@ -236,69 +263,222 @@ export default function App() {
       ctx.fillStyle = '#fff'
       ctx.fillText(t, fl.x - tw / 2, fl.y - 6 * u)
     }
-    setStats({ grid: !!res.grid, nRead: res.nRead, nLabels: res.labels.length, ms: res.ms })
+    const tracking = !!res.grid
+    setStats({ tracking, nLabels: res.labels.length, named: res.labels.filter((l) => l.name).length, ms: res.ms })
 
     let panelMsg = ''
     if (stop && !loc) {
       const seen = Object.keys(res.grids)
-      panelMsg = seen.length ? `${stop.panel} 패널로 이동 (지금 ${seen.join('·')} 패널)` : '라벨이 보이게 비춰 주세요'
+      panelMsg = seen.length ? `${stop.panel} 패널로 이동 후 사진` : '📷 사진을 찍어 위치를 잡아 주세요'
     }
     const gd = stop ? { dir: loc ? dirText(loc) : '', panelMsg, onScreen: !!(loc?.onScreen || hit) } : null
     guideRef.current = gd
     setGuide(gd)
-    window.__log.push({ ...extra, grid: !!res.grid, nRead: res.nRead, ms: Math.round(res.ms), stop: stop?.cell, hit: !!hit, dir: loc && dirText(loc) })
-
-    if (!stop || modalRef.current) return
-    // 촬영 후보: 화면에 인식된 미조사 촬영 대상 전부 (이동 중 지나가는 다른 대상도 함께 촬영). 현재 대상 우선
-    const cands = s.stops
-      .filter((st) => st.kind === 'shoot' && !s.results[st.cell])
-      .map((st) => ({ st, l: res.labels.find((l) => l.name === st.cell) }))
-      .filter((c) => c.l)
-      .sort((p, q) => (q.st === stop) - (p.st === stop))
-    const streak = streakRef.current
-    const seenNow = new Set(cands.map((c) => c.st.cell))
-    for (const k of Object.keys(streak)) if (!seenNow.has(k)) delete streak[k]
-    for (const c of cands) streak[c.st.cell] = (streak[c.st.cell] || 0) + 1
-    let cellImg = null
-    const pick = cands.find((c) => {
-      if (streak[c.st.cell] < STREAK_NEEDED || c.l.w < res.w * MIN_W_RATIO) return false
-      cellImg = extractCell(frame, c.l, c.l.grid)
-      return cellImg.inside // 칸 전체가 화면에 들어와야 촬영
-    })
-    if (!pick) return
-    const capStop = pick.st
-    const hitL = pick.l
-    delete streak[capStop.cell]
-
-    // 촬영: 칸 크롭 + 전체 프레임 저장, 이웃 칸으로 자동 개수 추정
-    const px = 1 / hitL.grid.a, py = 1 / hitL.grid.c
-    const x0 = Math.max(0, hitL.cx - px * CELL_CROP.side), x1 = Math.min(frame.width, hitL.cx + px * CELL_CROP.side)
-    const y0 = Math.max(0, hitL.cy - py * CELL_CROP.up), y1 = Math.min(frame.height, hitL.cy + py * CELL_CROP.down)
-    const crop = document.createElement('canvas')
-    crop.width = Math.round(x1 - x0)
-    crop.height = Math.round(y1 - y0)
-    crop.getContext('2d').drawImage(frame, x0, y0, x1 - x0, y1 - y0, 0, 0, crop.width, crop.height)
-    const neighbors = res.labels
-      .filter((l) => l !== hitL && l.name && l.grid)
-      .map((l) => extractCell(frame, l, l.grid))
-      .filter((e) => e.inside)
-    const auto = countItems(cellImg, neighbors)
-    const [cropBlob, fullBlob] = await Promise.all([toBlob(crop), toBlob(frame, 0.85)])
-    const shotId = await saveShot({ cell: capStop.cell, time: Date.now(), crop: cropBlob, full: fullBlob })
-    setMsg(`📸 ${capStop.cell} 촬영`)
-    if (modeRef.current === 'file') {
-      // 영상 테스트: 멈추지 않고 자동 추정값으로 기록 (목록에서 나중에 수정)
-      const ns = {
-        ...s,
-        results: { ...s.results, [capStop.cell]: { count: auto.count, needCheck: auto.needCheck, auto: auto.count, autoOnly: true, shotId, time: Date.now() } },
-      }
-      ns.idx = nextPending(ns, capStop === stop ? s.idx + 1 : s.idx)
-      setSession(ns)
-      flashRef.current = { cell: capStop.cell, label: auto.label, x: hitL.cx, y: hitL.cy - py * 0.3, until: extra.t + 1.5 }
-      return
-    }
-    setModalBoth({ stop: capStop, shotId, url: URL.createObjectURL(cropBlob), auto: auto.count })
+    window.__log.push({ ...extra, tracking, ms: Math.round(res.ms), stop: stop?.cell, hit: !!hit, dir: loc && dirText(loc) })
   }, [])
+
+  // ── 영상 1프레임: OCR 없이 추적 + 가끔 OCR로 밀림 확인 ──
+  const trackStep = async (frame, extra = {}) => {
+    const tr = trackRef.current
+    const res = trackFrame(frame, tr.grid)
+    // 흔들림 감지: 검출 라벨 수가 평소의 60% 밑으로 떨어진 프레임이 연속되면 번호가 밀렸을 수 있음 → 위치 잃음
+    const blurry = tr.avgBoxes > 0 && res.nBoxes < tr.avgBoxes * 0.6
+    tr.blur = blurry ? (tr.blur || 0) + 1 : 0
+    if (!blurry) tr.avgBoxes = tr.avgBoxes ? tr.avgBoxes * 0.7 + res.nBoxes * 0.3 : res.nBoxes
+    if (tr.grid && tr.blur >= 2) {
+      tr.grid = null
+      setMsg('화면이 흔들렸습니다 — 📷 사진을 찍어 위치를 다시 잡아 주세요')
+      res.grid = null
+      res.grids = {}
+      res.labels = res.labels.map((l) => ({ ...l, name: undefined }))
+    }
+    if (tr.grid) {
+      if (res.grid) {
+        tr.grid = res.grid
+        tr.lost = 0
+      } else if (++tr.lost >= TRACK_PARAMS.lostFrames) {
+        tr.grid = null
+        setMsg('위치를 놓쳤습니다 — 📷 사진을 찍어 주세요')
+      }
+    }
+    await handleResult(frame, res, extra)
+    // 1.5초마다 화면 중앙 라벨 몇 개만 OCR해서 추적이 한 칸씩 밀렸는지 확인 (기다리지 않고 뒤에서)
+    const now = performance.now()
+    // 줌 등으로 보이는 라벨 수가 마지막 확인 때보다 1.5배 넘게 변하면 주기를 기다리지 않고 바로 확인
+    const countJump = tr.verifyBoxes && (res.nBoxes > tr.verifyBoxes * 1.5 || res.nBoxes < tr.verifyBoxes / 1.5)
+    if (tr.grid && !tr.verifying && (now - tr.lastVerify > VERIFY_MS || countJump)) {
+      const named = res.labels
+        .filter((l) => l.name && l.w >= 40)
+        .sort((p, q) => Math.hypot(p.cx - res.w / 2, p.cy - res.h / 2) - Math.hypot(q.cx - res.w / 2, q.cy - res.h / 2))
+        .slice(0, VERIFY_N)
+      if (named.length >= 2) {
+        tr.verifying = true
+        tr.lastVerify = now
+        tr.verifyBoxes = res.nBoxes
+        readLabels(frame, named) // 크롭은 호출 즉시 만들어지므로 프레임이 바뀌어도 안전
+          .then((reads) => {
+            const dr = driftFromReads(named, reads)
+            if (!tr.grid) return
+            // 확인용 OCR이 라벨을 못 읽음(흔들림) → 연속 2번이면 번호가 밀렸는지 알 수 없으므로 위치 잃음
+            tr.unreadable = dr.total < 2 ? (tr.unreadable || 0) + 1 : 0
+            if (tr.unreadable >= 2) {
+              tr.grid = null
+              tr.unreadable = 0
+              setMsg('화면이 흔들렸습니다 — 📷 사진을 찍어 위치를 다시 잡아 주세요')
+              return
+            }
+            if (dr.votes >= 2 && (dr.dRow || dr.dCol)) {
+              // 2개 이상이 같은 만큼 어긋남 → 그만큼 보정
+              tr.grid = { ...tr.grid, b: tr.grid.b + dr.dCol, d: tr.grid.d + dr.dRow }
+              setMsg(`위치 보정 (${dr.dRow ? `${dr.dRow}행 ` : ''}${dr.dCol ? `${dr.dCol}열` : ''})`)
+            } else if (dr.total >= 2 && dr.agree === 0) {
+              // 읽힌 라벨이 모두 추적 번호와 다르고 일관된 보정도 없음 → 틀린 안내 대신 위치 잃음
+              tr.grid = null
+              setMsg('위치가 불확실합니다 — 📷 사진을 찍어 주세요')
+            }
+          })
+          .finally(() => (tr.verifying = false))
+      }
+    }
+    return res
+  }
+
+  // ── 사진: 위치 잡기 + (대상 칸이 보이면) 칸 확인·저장·개수 ──
+  const takePhoto = async () => {
+    if (busyRef.current || modalRef.current) return
+    const v = videoRef.current
+    if (!v || !v.videoWidth) return
+    busyRef.current = true
+    setBusy(true)
+    setMsg('사진 분석 중…')
+    try {
+      // 1) 선명한 사진: 가능하면 카메라 최대 화질 정지 사진, 안 되면 영상 프레임
+      let photo = null
+      const track = v.srcObject?.getVideoTracks?.()[0]
+      if (track && window.ImageCapture) {
+        try {
+          const blob = await new window.ImageCapture(track).takePhoto()
+          const bmp = await createImageBitmap(blob)
+          photo = document.createElement('canvas')
+          photo.width = bmp.width
+          photo.height = bmp.height
+          photo.getContext('2d').drawImage(bmp, 0, 0)
+        } catch {
+          photo = null
+        }
+      }
+      if (!photo) {
+        const f = grabFrame(v)
+        photo = document.createElement('canvas')
+        photo.width = f.width
+        photo.height = f.height
+        photo.getContext('2d').drawImage(f, 0, 0)
+      }
+
+      // 2) 사진 전체 OCR → 격자
+      const pres = await processFrame(photo)
+      const stop = current()
+      const grids = Object.values(pres.grids)
+      const g = (stop && pres.grids[stop.panel]) || grids.sort((p, q) => q.inliers.length - p.inliers.length)[0]
+      if (!g) {
+        setMsg('라벨을 읽지 못했습니다 — 라벨이 3개 이상 보이게 다시 찍어 주세요')
+        return
+      }
+
+      // 3) 사진 격자 → 영상 좌표로 옮겨 추적 시작
+      const guess = photoGridToVideo(g, photo.width, photo.height, v.videoWidth, v.videoHeight)
+      const vres = trackFrame(grabFrame(v), guess)
+      trackRef.current = { ...trackRef.current, grid: vres.grid || guess, lost: 0, blur: 0, avgBoxes: vres.nBoxes, lastVerify: performance.now(), verifyBoxes: vres.nBoxes }
+
+      // 4) 확인·저장할 칸 고르기
+      //    ① 가운데 고정 프레임 안에 든 칸 (사람이 먼저 찾아 맞춘 경우) → 조사 대상이면 순서와 무관하게 저장
+      //    ② 없으면 사진에 온전히 담긴 미조사 대상 (현재 안내 대상 우선)
+      const s = sessionRef.current
+      const sPh = photo.width / v.videoWidth
+      const oyPh = (photo.height - v.videoHeight * sPh) / 2
+      const fr = {
+        x0: v.videoWidth * (0.5 - CENTER_FRAME.w / 2) * sPh,
+        x1: v.videoWidth * (0.5 + CENTER_FRAME.w / 2) * sPh,
+        y0: v.videoHeight * (0.5 - frameH(v.videoWidth, v.videoHeight) / 2) * sPh + oyPh,
+        y1: v.videoHeight * (0.5 + frameH(v.videoWidth, v.videoHeight) / 2) * sPh + oyPh,
+      }
+      // 칸 중심 = 라벨 중심에서 칸 높이의 1/4 위 (라벨은 칸 아래쪽)
+      const inFrame = pres.labels
+        .filter((l) => l.name && l.grid)
+        .map((l) => ({ l, x: l.cx, y: l.cy - 0.25 / l.grid.c }))
+        .filter((q) => q.x > fr.x0 && q.x < fr.x1 && q.y > fr.y0 && q.y < fr.y1)
+        .sort((p, q) => Math.hypot(p.x - (fr.x0 + fr.x1) / 2, p.y - (fr.y0 + fr.y1) / 2) - Math.hypot(q.x - (fr.x0 + fr.x1) / 2, q.y - (fr.y0 + fr.y1) / 2))[0]?.l
+      const pendingShoot = (name) => s.stops.find((st) => st.cell === name && st.kind === 'shoot' && !s.results[st.cell])
+      let pick = null
+      let cellImg = null
+      if (inFrame) {
+        const st = pendingShoot(inFrame.name)
+        const e = extractCell(photo, inFrame, inFrame.grid)
+        if (st && e.inside) {
+          pick = { st, l: inFrame }
+          cellImg = e
+        }
+      }
+      if (!pick) {
+        const cands = s.stops
+          .filter((st) => st.kind === 'shoot' && !s.results[st.cell])
+          .map((st) => ({ st, l: pres.labels.find((l) => l.name === st.cell) }))
+          .filter((c) => c.l)
+          .sort((p, q) => (q.st === stop) - (p.st === stop))
+        pick = cands.find((c) => (cellImg = extractCell(photo, c.l, c.l.grid)).inside) || null
+      }
+      if (!pick) {
+        const here = pres.labels.find((l) => l.name)?.name
+        const done = inFrame && s.results[inFrame.name]
+        setMsg(
+          inFrame && !s.stops.some((st) => st.cell === inFrame.name)
+            ? `${inFrame.name} 은(는) 조사 대상이 아닙니다 (위치 확인 ✓)`
+            : done
+              ? `${inFrame.name} 은(는) 이미 조사했습니다 (목록에서 수정 가능)`
+              : stop && guideRef.current?.onScreen
+                ? `${stop.cell} 칸이 사진에 온전히 안 담겼습니다 — 가운데 프레임에 맞춰 다시 찍어 주세요`
+                : `위치 확인 ✓ (${here || g.panel + ' 패널'} 근처) — 안내를 따라 이동하세요`,
+        )
+        return
+      }
+      const capStop = pick.st
+      const hitL = pick.l
+      const px = 1 / hitL.grid.a, py = 1 / hitL.grid.c
+      const x0 = Math.max(0, hitL.cx - px * CELL_CROP.side), x1 = Math.min(photo.width, hitL.cx + px * CELL_CROP.side)
+      const y0 = Math.max(0, hitL.cy - py * CELL_CROP.up), y1 = Math.min(photo.height, hitL.cy + py * CELL_CROP.down)
+      const crop = document.createElement('canvas')
+      crop.width = Math.round(x1 - x0)
+      crop.height = Math.round(y1 - y0)
+      crop.getContext('2d').drawImage(photo, x0, y0, x1 - x0, y1 - y0, 0, 0, crop.width, crop.height)
+      const neighbors = pres.labels
+        .filter((l) => l !== hitL && l.name && l.grid)
+        .map((l) => extractCell(photo, l, l.grid))
+        .filter((e) => e.inside)
+      const auto = countItems(cellImg, neighbors)
+      const [cropBlob, fullBlob] = await Promise.all([toBlob(crop), toBlob(photo, 0.85)])
+      const shotId = await saveShot({ cell: capStop.cell, time: Date.now(), crop: cropBlob, full: fullBlob })
+      setMsg(`📸 ${capStop.cell} 확인·저장`)
+      if (modeRef.current === 'file') {
+        // 영상 테스트: 사진=영상 프레임이라 좌표가 같음 → 결과를 잠깐 표시
+        flashRef.current = { cell: capStop.cell, label: auto.label, x: hitL.cx, y: hitL.cy - py * 0.3, until: v.currentTime + 1.5 }
+      }
+      if (modeRef.current === 'file' && autoConfirmRef.current) {
+        // 시연 녹화: 창 없이 자동 인식값으로 기록
+        const ns = {
+          ...s,
+          results: { ...s.results, [capStop.cell]: { count: auto.count, needCheck: auto.needCheck, auto: auto.count, autoOnly: true, shotId, time: Date.now() } },
+        }
+        ns.idx = nextPending(ns, capStop === stop ? s.idx + 1 : s.idx)
+        setSession(ns)
+        return { cell: capStop.cell, auto: auto.count }
+      }
+      setModalBoth({ stop: capStop, shotId, url: URL.createObjectURL(cropBlob), auto: auto.count })
+      return { cell: capStop.cell, auto: auto.count }
+    } finally {
+      busyRef.current = false
+      setBusy(false)
+    }
+  }
 
   // ── 개수 확정 / 이동 ──
   const confirmCount = (count) => {
@@ -316,13 +496,11 @@ export default function App() {
     setSession(ns)
     URL.revokeObjectURL(m.url)
     setModalBoth(null)
-    streakRef.current = {}
   }
   const retake = () => {
     const m = modalRef.current
     if (m) URL.revokeObjectURL(m.url)
     setModalBoth(null)
-    streakRef.current = {}
   }
   const markLocated = () => {
     const s = sessionRef.current
@@ -337,12 +515,10 @@ export default function App() {
     if (!s.stops.length) return
     const n = s.stops.length
     setSession({ ...s, idx: (((s.idx < 0 ? 0 : s.idx) + delta) % n + n) % n })
-    streakRef.current = {}
   }
   const jumpTo = (i) => {
     setSession({ ...sessionRef.current, idx: i })
     setShowList(false)
-    streakRef.current = {}
   }
   const editResult = async (stop) => {
     const r = sessionRef.current.results[stop.cell]
@@ -449,9 +625,7 @@ export default function App() {
     await seekTo(v, t)
     if (token !== undefined && token !== runRef.current.token) return false
     const frame = grabFrame(v)
-    const res = await processFrame(frame)
-    if (token !== undefined && token !== runRef.current.token) return false
-    await handleResult(frame, res, { t: +t.toFixed(2) })
+    await trackStep(frame, { t: +t.toFixed(2) })
     setFileTime({ t, dur: v.duration })
     return true
   }
@@ -468,7 +642,7 @@ export default function App() {
     })
     setVidSize({ w: v.videoWidth, h: v.videoHeight })
     setMode('file')
-    streakRef.current = {}
+    trackRef.current = { grid: null, lost: 0, lastVerify: 0, verifying: false, avgBoxes: 0, blur: 0 }
     setFileTime({ t: 0, dur: v.duration })
     setMsg(`영상 ${v.videoWidth}×${v.videoHeight}, ${v.duration.toFixed(1)}초`)
     await processAt(0)
@@ -485,14 +659,15 @@ export default function App() {
     }
     if (token === runRef.current.token) setRunning(false)
   }
-  const startCamera = async () => {
+  const startCamera = async (resKey = resolution) => {
     stop()
+    stopCamera()
     const v = videoRef.current
+    const R = RESOLUTIONS[resKey]
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: false,
-        // 확대(근접) 상태로 움직이며 인식하므로 FHD면 충분 (처리 속도 우선)
-        video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } },
+        video: { facingMode: { ideal: 'environment' }, width: { ideal: R.w }, height: { ideal: R.h } },
       })
       v.removeAttribute('src')
       v.srcObject = stream
@@ -500,19 +675,16 @@ export default function App() {
       await v.play()
       setVidSize({ w: v.videoWidth, h: v.videoHeight })
       setMode('camera')
-      streakRef.current = {}
-      setMsg(`카메라 ${v.videoWidth}×${v.videoHeight}`)
+      trackRef.current = { grid: null, lost: 0, lastVerify: 0, verifying: false, avgBoxes: 0, blur: 0 }
+      setMsg(`카메라 ${v.videoWidth}×${v.videoHeight} — 📷 사진을 찍어 위치를 잡아 주세요`)
       const token = ++runRef.current.token
       setRunning(true)
       while (token === runRef.current.token) {
-        if (modalRef.current) {
-          await new Promise((r) => setTimeout(r, 150))
+        if (modalRef.current || busyRef.current) {
+          await new Promise((r) => setTimeout(r, 120))
           continue
         }
-        const frame = grabFrame(v)
-        const res = await processFrame(frame)
-        if (token !== runRef.current.token) break
-        await handleResult(frame, res)
+        await trackStep(grabFrame(v))
         await new Promise((r) => requestAnimationFrame(r))
       }
     } catch (e) {
@@ -575,7 +747,13 @@ export default function App() {
     await fetch('/__save?name=' + encodeURIComponent(fname), { method: 'POST', body: blob })
     return { fname, size: blob.size, mime }
   }
-  if (import.meta.env.DEV) window.__app = { processAt, openVideo, REF_VIDEO, confirmCount, recordDemo, session: () => sessionRef.current, setSession }
+  if (import.meta.env.DEV)
+    window.__app = {
+      processAt, openVideo, REF_VIDEO, confirmCount, recordDemo, takePhoto, setSession,
+      session: () => sessionRef.current,
+      track: () => trackRef.current,
+      setAutoConfirm: (v) => (autoConfirmRef.current = v),
+    }
 
   const onPickVideo = (e) => {
     const f = e.target.files?.[0]
@@ -590,17 +768,44 @@ export default function App() {
   return (
     <div className="app">
       <div className="topbar">
-        <span className={'pill ' + (stats?.grid ? 'on' : 'off')}>격자 {stats?.grid ? 'ON' : 'OFF'}</span>
-        <span>판독 {stats ? `${stats.nRead}/${stats.nLabels}` : '-'}</span>
+        <span className={'pill ' + (stats?.tracking ? 'on' : 'off')}>{stats?.tracking ? '위치 추적 중' : '위치 모름'}</span>
+        <span>{stats ? `${stats.named}/${stats.nLabels}칸` : '-'}</span>
         <span>{stats ? `${stats.ms.toFixed(0)}ms` : '-'}</span>
+        <select value={resolution} onChange={(e) => changeResolution(e.target.value)} title="카메라 화질">
+          {Object.entries(RESOLUTIONS).map(([k, r]) => (
+            <option key={k} value={k}>{r.label}</option>
+          ))}
+        </select>
         <span className="msg">{msg}</span>
       </div>
 
       <div className="stage" ref={stageRef}>
-        <div className="frame" style={{ width: fit.w, height: fit.h }}>
+        {/* 카메라 화면 아무 데나 눌러도 사진 */}
+        <div className="frame" style={{ width: fit.w, height: fit.h }} onClick={mode !== 'idle' ? takePhoto : undefined}>
           <video ref={videoRef} playsInline muted />
           <canvas ref={overlayRef} />
+          {mode !== 'idle' && (
+            <div
+              className="center-frame"
+              style={{ width: `${CENTER_FRAME.w * 100}%`, height: `${frameH(vidSize.w, vidSize.h) * 100}%` }}
+            >
+              <span>여기에 칸을 맞추고 촬영</span>
+            </div>
+          )}
         </div>
+        {mode !== 'idle' && (
+          <button
+            className={'shutter' + (guide?.onScreen ? ' ready' : '') + (busy ? ' busy' : '')}
+            onClick={(e) => {
+              e.stopPropagation()
+              takePhoto()
+            }}
+            disabled={busy}
+          >
+            <span className="shutter-icon">{busy ? '⏳' : '📷'}</span>
+            <span className="shutter-text">{busy ? '분석 중' : stats?.tracking ? '촬영' : '위치 잡기'}</span>
+          </button>
+        )}
         {mode === 'idle' && (
           <div className="hint">
             {session.stops.length ? '[카메라]를 눌러 조사를 시작하세요' : '[엑셀 불러오기]로 오늘 재고 엑셀을 선택하세요'}
@@ -649,7 +854,7 @@ export default function App() {
             엑셀 불러오기
             <input type="file" accept=".xlsm,.xlsx" hidden onChange={onPickExcel} />
           </label>
-          <button onClick={mode === 'camera' && running ? () => (stop(), stopCamera(), setMode('idle')) : startCamera}>
+          <button onClick={mode === 'camera' && running ? () => (stop(), stopCamera(), setMode('idle')) : () => startCamera()}>
             {mode === 'camera' && running ? '카메라 끄기' : '카메라'}
           </button>
           <button onClick={() => setShowList(true)} disabled={!session.stops.length}>목록</button>
