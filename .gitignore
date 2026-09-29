@@ -1,0 +1,12 @@
+node_modules/
+dist/
+dev-dist/
+*.log
+
+# 촬영 사진·재고 데이터 (내보내기 결과)
+*.zip
+촬영기록*.csv
+재고체크_*.zip
+# 테스트 영상 (용량이 커서 제외)
+*.mp4
+*.mov
