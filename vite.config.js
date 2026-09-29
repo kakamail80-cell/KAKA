@@ -26,5 +26,9 @@ export default defineConfig(({ mode }) => ({
       },
     }),
   ].filter(Boolean),
-  server: { host: mode === 'phone' },
+  server: {
+    host: mode === 'phone',
+    // 구글 드라이브 폴더는 파일 변경 알림이 누락되는 경우가 있어 주기적으로 확인
+    watch: { usePolling: true, interval: 500 },
+  },
 }))

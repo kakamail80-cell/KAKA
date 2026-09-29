@@ -3,7 +3,7 @@ import { detectLabels } from './detect.js'
 import { readLabels } from './ocr.js'
 import { estimateGrid, predictCell } from './grid.js'
 
-export const cellName = (row, col) => `A-${row}-${col}`
+export const cellName = (panel, row, col) => `${panel}-${row}-${col}`
 
 let frameCanvas = null
 
@@ -39,32 +39,48 @@ export async function processFrame(frame) {
     source: null,
   }))
   const accepted = labels.filter((l) => l.ocr && l.ocr.row != null)
-  const pts = accepted.map((l) => ({ cx: l.cx, cy: l.cy, row: l.ocr.row, col: l.ocr.col }))
-  const grid = estimateGrid(pts)
 
-  if (grid) {
-    const inl = new Set(grid.inliers.map((k) => accepted[k]))
-    for (const l of labels) {
-      if (inl.has(l)) {
-        l.cell = { row: l.ocr.row, col: l.ocr.col }
-        l.source = 'ocr'
-      } else {
-        // OCR 결과가 격자와 어긋나면(오인식 의심) 버리고 위치로 추정한다
-        const c = predictCell(grid, l.cx, l.cy)
-        if (c) {
-          l.cell = c
-          l.source = 'grid'
-        }
-      }
+  // 패널(A~D)별로 격자 추정
+  const grids = {}
+  for (const panel of new Set(accepted.map((l) => l.ocr.panel))) {
+    const mine = accepted.filter((l) => l.ocr.panel === panel)
+    const g = estimateGrid(mine.map((l) => ({ cx: l.cx, cy: l.cy, row: l.ocr.row, col: l.ocr.col, conf: l.ocr.conf })))
+    if (!g) continue
+    g.panel = panel
+    grids[panel] = g
+    for (const k of g.inliers) {
+      const l = mine[k]
+      l.cell = { panel, row: l.ocr.row, col: l.ocr.col }
+      l.source = 'ocr'
+      l.grid = g
     }
   }
-  for (const l of labels) if (l.cell) l.name = cellName(l.cell.row, l.cell.col)
+
+  // 못 읽었거나 격자와 어긋난(오인식 의심) 라벨은 위치로 추정. 여러 패널이 겹치면 오차가 작은 쪽
+  const gridList = Object.values(grids)
+  for (const l of labels) {
+    if (l.cell) continue
+    const readPanel = /^[A-D]/.exec(l.ocr?.text || '')?.[0]
+    let best = null
+    for (const g of gridList) {
+      if (readPanel && readPanel !== g.panel) continue
+      const c = predictCell(g, l.cx, l.cy)
+      if (c && (!best || c.err < best.c.err)) best = { g, c }
+    }
+    if (best) {
+      l.cell = { panel: best.g.panel, row: best.c.row, col: best.c.col }
+      l.source = 'grid'
+      l.grid = best.g
+    }
+  }
+  for (const l of labels) if (l.cell) l.name = cellName(l.cell.panel, l.cell.row, l.cell.col)
 
   return {
     w,
     h,
     labels,
-    grid,
+    grid: gridList.length ? gridList[0] : null,
+    grids,
     nRead: accepted.length,
     ms: performance.now() - t0,
     tDetect: t1 - t0,

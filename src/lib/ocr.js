@@ -2,12 +2,25 @@
 import { createWorker, createScheduler, PSM } from 'tesseract.js'
 
 export const OCR_PARAMS = {
-  minLabelW: 60, // 원본 좌표 기준. 이보다 작으면 OCR 시도 안 함
-  minConf: 80, // tesseract 신뢰도(0~100). run.py의 0.8과 동일
+  // 원본 좌표 기준. 이보다 작으면 OCR 시도 안 함 (4K 벽 전체 거리에서 라벨 폭 ≈ 51~54px, 사람 눈으로 판독 가능)
+  minLabelW: 40,
+  // tesseract 신뢰도(0~100). 이 라벨에서는 맞게 읽어도 0이 자주 나와 신뢰도 대신 격자 일치(RANSAC)로 오판독을 거른다
+  minConf: 0,
   cropH: 64, // OCR 입력 높이로 정규화
 }
 
-const LABEL_RE = /^A-(\d{1,2})-(\d{1,2})$/
+// 라벨 인쇄 형식: A-행-열, 열은 항상 두 자리(A-5-05). 멀리서는 하이픈이 점처럼 작아 OCR이 자주 빠뜨리므로
+// 하이픈을 지운 뒤 "A + 숫자 3~4자리" → 끝 두 자리 = 열, 앞 = 행 으로 해석한다
+// 패널 글자(A~D)도 읽어서 패널별로 격자를 따로 맞춘다 (패널 경계 너머로 번호가 번지는 것 방지)
+const LABEL_RE = /^([A-D])(\d{1,2})(\d{2})$/
+export function parseLabel(text) {
+  const t = text.replace(/[\s-]+/g, '')
+  const m = LABEL_RE.exec(t)
+  if (!m) return null
+  const row = +m[2], col = +m[3]
+  if (row < 1 || col < 1) return null
+  return { panel: m[1], row, col }
+}
 
 let scheduler = null
 let readyPromise = null
@@ -20,7 +33,7 @@ export function initOcr(nWorkers = Math.min(4, Math.max(2, (navigator.hardwareCo
       Array.from({ length: nWorkers }, async () => {
         const w = await createWorker('eng', 1)
         await w.setParameters({
-          tessedit_char_whitelist: 'A0123456789-',
+          tessedit_char_whitelist: 'ABCD0123456789-',
           tessedit_pageseg_mode: PSM.SINGLE_LINE,
         })
         return w
@@ -97,13 +110,14 @@ export async function readLabels(src, boxes, p = OCR_PARAMS) {
       const { data } = await scheduler.addJob('recognize', crop)
       const text = (data.text || '').replace(/\s+/g, '')
       const conf = data.confidence
-      const m = LABEL_RE.exec(text)
+      const m = parseLabel(text)
       const ok = m && conf >= p.minConf
       return {
         text,
         conf,
-        row: ok ? +m[1] : null,
-        col: ok ? +m[2] : null,
+        panel: ok ? m.panel : null,
+        row: ok ? m.row : null,
+        col: ok ? m.col : null,
       }
     }),
   )

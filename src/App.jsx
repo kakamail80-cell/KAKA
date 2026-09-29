@@ -10,8 +10,11 @@ const MIN_W_RATIO = 0.08 // 라벨 폭 ≥ 화면 폭 8%
 // 칸 크롭 범위 (격자 한 칸 간격 기준, 라벨 중심에서)
 const CELL_CROP = { left: 0.55, right: 0.55, up: 0.9, down: 0.25 }
 
-const LABEL_RE = /A-\d{1,2}-\d{1,2}/g
-const parseTargets = (text) => [...new Set((text.toUpperCase().match(LABEL_RE) || []))]
+// A-5-05 / A-5-5 모두 A-5-5 로 통일 (라벨 인쇄는 열이 두 자리)
+const LABEL_RE = /([A-D])-(\d{1,2})-(\d{1,2})/g
+const parseTargets = (text) => [
+  ...new Set([...text.toUpperCase().matchAll(LABEL_RE)].map((m) => `${m[1]}-${+m[2]}-${+m[3]}`)),
+]
 
 function loadTargets() {
   try {
@@ -60,7 +63,7 @@ function toBlob(canvas, q = 0.9) {
 }
 
 async function captureShot(frame, res, label) {
-  const g = res.grid
+  const g = label.grid
   const px = 1 / g.a, py = 1 / g.c // 한 칸 간격(px)
   const x0 = Math.max(0, label.cx - px * CELL_CROP.left)
   const x1 = Math.min(frame.width, label.cx + px * CELL_CROP.right)
@@ -247,7 +250,8 @@ export default function App() {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: false,
-        video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } },
+        // 기본 화질 4K (지원 안 되는 폰은 가능한 최대 화질로 내려감)
+        video: { facingMode: { ideal: 'environment' }, width: { ideal: 3840 }, height: { ideal: 2160 } },
       })
       v.removeAttribute('src')
       v.srcObject = stream
