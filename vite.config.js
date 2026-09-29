@@ -2,12 +2,33 @@ import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 import basicSsl from '@vitejs/plugin-basic-ssl'
 import { VitePWA } from 'vite-plugin-pwa'
+import fs from 'node:fs'
+import path from 'node:path'
+
+// 개발 전용: 브라우저에서 만든 시연 영상을 작업 폴더에 저장 (POST /__save?name=파일명)
+const devSave = () => ({
+  name: 'dev-save',
+  apply: 'serve',
+  configureServer(server) {
+    server.middlewares.use('/__save', (req, res) => {
+      if (req.method !== 'POST') return (res.statusCode = 405), res.end()
+      const name = path.basename(new URL(req.url, 'http://x').searchParams.get('name') || 'output.bin')
+      const chunks = []
+      req.on('data', (c) => chunks.push(c))
+      req.on('end', () => {
+        fs.writeFileSync(path.join(server.config.root, name), Buffer.concat(chunks))
+        res.end(name)
+      })
+    })
+  },
+})
 
 // `npm run dev`       → http://localhost:5173 (PC 파일 테스트용)
 // `npm run dev:phone` → https://<PC IP>:5173 (같은 와이파이의 폰에서 카메라 사용)
 export default defineConfig(({ mode }) => ({
   plugins: [
     react(),
+    devSave(),
     mode === 'phone' && basicSsl(),
     VitePWA({
       registerType: 'autoUpdate',

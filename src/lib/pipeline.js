@@ -60,7 +60,7 @@ export async function processFrame(frame) {
   const gridList = Object.values(grids)
   for (const l of labels) {
     if (l.cell) continue
-    const readPanel = /^[A-D]/.exec(l.ocr?.text || '')?.[0]
+    const readPanel = /^[A-Z]/.exec(l.ocr?.text || '')?.[0]
     let best = null
     for (const g of gridList) {
       if (readPanel && readPanel !== g.panel) continue

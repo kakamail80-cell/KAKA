@@ -4,11 +4,12 @@
 export const DETECT_PARAMS = {
   // 검출은 축소 영상에서 수행 (속도). 4K 기준 1/3 축소 → 멀리 있는 작은 라벨도 검출
   procWidth: 1280,
-  maxSat: 60, // OpenCV 기준 S(0~255) 이하
-  // V(0~255) 기준: 화면 상위 1% 밝기 - valMargin (라벨 종이 ≈ 225~230, 투명 서랍 앞면 ≈ 170)
-  valMargin: 40,
+  maxSat: 50, // OpenCV 기준 S(0~255) 이하
+  // V(0~255) 기준: 화면 상위 1% 밝기 - valMargin (HD 샘플: 라벨 ≈ 225~230, 서랍 앞면 ≈ 170.
+  // 밝은 조명 4K 샘플은 서랍 앞면도 밝아서 기준을 높여야 라벨과 붙지 않음)
+  valMargin: 25,
   minValFloor: 150,
-  minValCeil: 210,
+  minValCeil: 235,
   closeR: 2, // 닫힘 연산 반경 (축소 영상 px)
   minAspect: 2,
   maxAspect: 6.5,

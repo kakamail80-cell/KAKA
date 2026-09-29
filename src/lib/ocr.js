@@ -11,12 +11,13 @@ export const OCR_PARAMS = {
 
 // 라벨 인쇄 형식: A-행-열, 열은 항상 두 자리(A-5-05). 멀리서는 하이픈이 점처럼 작아 OCR이 자주 빠뜨리므로
 // 하이픈을 지운 뒤 "A + 숫자 3~4자리" → 끝 두 자리 = 열, 앞 = 행 으로 해석한다
-// 패널 글자(A~D)도 읽어서 패널별로 격자를 따로 맞춘다 (패널 경계 너머로 번호가 번지는 것 방지)
-const LABEL_RE = /^([A-D])(\d{1,2})(\d{2})$/
+// 패널 글자도 읽어서 패널별로 격자를 따로 맞춘다 (패널 경계 너머로 번호가 번지는 것 방지).
+// 인식 글자는 조사 대상에 나오는 패널만 허용 (글자 후보가 많으면 0→O, 8→B 같은 오판독이 늘어남)
+let panelLetters = 'ABCD'
 export function parseLabel(text) {
   const t = text.replace(/[\s-]+/g, '')
-  const m = LABEL_RE.exec(t)
-  if (!m) return null
+  const m = /^([A-Z])(\d{1,2})(\d{2})$/.exec(t)
+  if (!m || !panelLetters.includes(m[1])) return null
   const row = +m[2], col = +m[3]
   if (row < 1 || col < 1) return null
   return { panel: m[1], row, col }
@@ -24,16 +25,26 @@ export function parseLabel(text) {
 
 let scheduler = null
 let readyPromise = null
+let workers = []
+
+/** 조사 대상 패널 글자 설정 (예: ['A','B','H']) */
+export async function setPanels(letters) {
+  const next = [...new Set(letters.length ? letters : ['A', 'B', 'C', 'D'])].sort().join('')
+  if (next === panelLetters) return
+  panelLetters = next
+  await initOcr()
+  await Promise.all(workers.map((w) => w.setParameters({ tessedit_char_whitelist: panelLetters + '0123456789-' })))
+}
 
 export function initOcr(nWorkers = Math.min(4, Math.max(2, (navigator.hardwareConcurrency || 4) >> 1))) {
   if (readyPromise) return readyPromise
   readyPromise = (async () => {
     scheduler = createScheduler()
-    const workers = await Promise.all(
+    workers = await Promise.all(
       Array.from({ length: nWorkers }, async () => {
         const w = await createWorker('eng', 1)
         await w.setParameters({
-          tessedit_char_whitelist: 'ABCD0123456789-',
+          tessedit_char_whitelist: panelLetters + '0123456789-',
           tessedit_pageseg_mode: PSM.SINGLE_LINE,
         })
         return w
