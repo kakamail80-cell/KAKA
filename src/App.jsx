@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { grabFrame, processFrame } from './lib/pipeline.js'
-import { initOcr, readLabels, setPanels } from './lib/ocr.js'
+import { readLabels, setPanels } from './lib/ocr.js'
 import { exportZip, getShot, loadSession, saveSession, saveShot } from './lib/store.js'
 import { readTargets, writeStock } from './lib/excel.js'
 import { buildRoute, locate } from './lib/route.js'
@@ -15,6 +15,8 @@ const CENTER_FRAME = { w: 0.26, cellAspect: 0.56 } // 폭 = 화면의 26%, 높�
 const frameH = (vw, vh) => CENTER_FRAME.w * (vw / vh) * CENTER_FRAME.cellAspect
 const VERIFY_MS = 600 // 추적 중 OCR로 밀림 확인 주기
 const VERIFY_N = 4 // 확인할 라벨 수 (화면 중앙 가까운 순)
+const PHOTO_MAX_OCR = 14 // 사진 분석 시 읽는 라벨 수 (가운데·큰 라벨 우선)
+const CAPTURE_MIN_LABEL_RATIO = 0.04 // 칸 사진 저장 최소 라벨 폭 (사진 폭 대비). 4K 근접 ≈ 6%, 벽 전체 ≈ 1.4%
 const RESOLUTIONS = {
   '4k': { label: '4K', w: 3840, h: 2160 },
   fhd: { label: 'FHD', w: 1920, h: 1080 },
@@ -211,7 +213,7 @@ export default function App() {
   }
 
   useEffect(() => {
-    initOcr().then((n) => setMsg(`OCR 준비 완료 (작업자 ${n}개)`), (e) => setMsg('OCR 로드 실패: ' + e.message))
+    setMsg('문자 인식 준비 완료 — [카메라]를 누르세요')
     loadSession().then((s) => s && setSession(s), () => {})
     window.__log = []
   }, [])
@@ -383,7 +385,13 @@ export default function App() {
       }
 
       // 2) 사진 전체 OCR → 격자
-      const pres = await processFrame(photo)
+      // 전용 인식기(빠름): 가운데·큰 라벨 14개 → 실패하면 전부 → 그래도 실패하면 tesseract(느림) 14개
+      let pres = await processFrame(photo, { maxOcr: PHOTO_MAX_OCR })
+      if (!Object.keys(pres.grids).length && pres.labels.length > PHOTO_MAX_OCR) pres = await processFrame(photo)
+      if (!Object.keys(pres.grids).length) {
+        setMsg('정밀 인식 중… (처음 한 번은 인식 엔진을 내려받아 조금 걸립니다)')
+        pres = await processFrame(photo, { maxOcr: PHOTO_MAX_OCR, engine: 'tesseract' })
+      }
       const stop = current()
       const grids = Object.values(pres.grids)
       const g = (stop && pres.grids[stop.panel]) || grids.sort((p, q) => q.inliers.length - p.inliers.length)[0]
@@ -416,12 +424,14 @@ export default function App() {
         .filter((q) => q.x > fr.x0 && q.x < fr.x1 && q.y > fr.y0 && q.y < fr.y1)
         .sort((p, q) => Math.hypot(p.x - (fr.x0 + fr.x1) / 2, p.y - (fr.y0 + fr.y1) / 2) - Math.hypot(q.x - (fr.x0 + fr.x1) / 2, q.y - (fr.y0 + fr.y1) / 2))[0]?.l
       const pendingShoot = (name) => s.stops.find((st) => st.cell === name && st.kind === 'shoot' && !s.results[st.cell])
+      // 멀리서 찍은 사진은 칸이 너무 작아 개수 확인이 안 되므로 위치 확인만 (라벨 폭이 사진 폭의 4% 이상일 때 저장)
+      const bigEnough = (l) => l.w >= photo.width * CAPTURE_MIN_LABEL_RATIO
       let pick = null
       let cellImg = null
       if (inFrame) {
         const st = pendingShoot(inFrame.name)
         const e = extractCell(photo, inFrame, inFrame.grid)
-        if (st && e.inside) {
+        if (st && e.inside && bigEnough(inFrame)) {
           pick = { st, l: inFrame }
           cellImg = e
         }
@@ -430,15 +440,19 @@ export default function App() {
         const cands = s.stops
           .filter((st) => st.kind === 'shoot' && !s.results[st.cell])
           .map((st) => ({ st, l: pres.labels.find((l) => l.name === st.cell) }))
-          .filter((c) => c.l)
+          .filter((c) => c.l && bigEnough(c.l))
           .sort((p, q) => (q.st === stop) - (p.st === stop))
         pick = cands.find((c) => (cellImg = extractCell(photo, c.l, c.l.grid)).inside) || null
       }
       if (!pick) {
         const here = pres.labels.find((l) => l.name)?.name
         const done = inFrame && s.results[inFrame.name]
+        const named = pres.labels.filter((l) => l.name)
+        const far = named.length && !named.some(bigEnough)
         setMsg(
-          inFrame && !s.stops.some((st) => st.cell === inFrame.name)
+          far
+            ? `위치 확인 ✓ (${here || g.panel + ' 패널'} 근처) — 대상 칸까지 가까이 가서 다시 찍어 주세요`
+            : inFrame && !s.stops.some((st) => st.cell === inFrame.name)
             ? `${inFrame.name} 은(는) 조사 대상이 아닙니다 (위치 확인 ✓)`
             : done
               ? `${inFrame.name} 은(는) 이미 조사했습니다 (목록에서 수정 가능)`

@@ -12,12 +12,15 @@ const devSave = () => ({
   configureServer(server) {
     server.middlewares.use('/__save', (req, res) => {
       if (req.method !== 'POST') return (res.statusCode = 405), res.end()
-      const name = path.basename(new URL(req.url, 'http://x').searchParams.get('name') || 'output.bin')
+      // 저장 위치는 작업 폴더 루트 또는 src/lib (학습된 글자 모델) 만 허용
+      const raw = new URL(req.url, 'http://x').searchParams.get('name') || 'output.bin'
+      const sub = raw.startsWith('src/lib/') ? 'src/lib' : ''
+      const name = path.basename(raw)
       const chunks = []
       req.on('data', (c) => chunks.push(c))
       req.on('end', () => {
-        fs.writeFileSync(path.join(server.config.root, name), Buffer.concat(chunks))
-        res.end(name)
+        fs.writeFileSync(path.join(server.config.root, sub, name), Buffer.concat(chunks))
+        res.end(path.join(sub, name))
       })
     })
   },

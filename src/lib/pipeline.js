@@ -1,6 +1,6 @@
 // 프레임 1장 처리: 라벨 검출 → OCR → 격자 → 칸번호 부여
 import { detectLabels } from './detect.js'
-import { readLabels } from './ocr.js'
+import { readLabels, readLabelsTesseract } from './ocr.js'
 import { estimateGrid, predictCell } from './grid.js'
 
 export const cellName = (panel, row, col) => `${panel}-${row}-${col}`
@@ -22,12 +22,21 @@ export function grabFrame(video) {
 /**
  * @returns {Promise<{w:number,h:number,labels:Array,grid:object|null,nRead:number,ms:number,tDetect:number,tOcr:number}>}
  */
-export async function processFrame(frame) {
+export async function processFrame(frame, opts = {}) {
   const t0 = performance.now()
   const w = frame.width, h = frame.height
   const boxes = detectLabels(frame, w, h)
   const t1 = performance.now()
-  const reads = await readLabels(frame, boxes)
+  // maxOcr: 위치를 잡는 데는 라벨 몇 개면 충분하므로, 화면 중앙에 가깝고 큰 라벨부터 N개만 OCR (나머지는 격자로 번호 부여)
+  let toRead = boxes
+  if (opts.maxOcr && boxes.length > opts.maxOcr) {
+    const fx = opts.focus?.x ?? w / 2, fy = opts.focus?.y ?? h / 2
+    const diag = Math.hypot(w, h)
+    const score = (b) => Math.hypot(b.x + b.w / 2 - fx, b.y + b.h / 2 - fy) / diag - b.w / w
+    const chosen = new Set([...boxes].sort((p, q) => score(p) - score(q)).slice(0, opts.maxOcr))
+    toRead = boxes.map((b) => (chosen.has(b) ? b : { ...b, w: 0 })) // 폭 0 → OCR 건너뜀
+  }
+  const reads = await (opts.engine === 'tesseract' ? readLabelsTesseract : readLabels)(frame, toRead)
   const t2 = performance.now()
 
   const labels = boxes.map((b, i) => ({

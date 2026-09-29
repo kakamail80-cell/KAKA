@@ -1,5 +1,7 @@
 // 라벨 OCR (tesseract.js) + 형식 필터
 import { createWorker, createScheduler, PSM } from 'tesseract.js'
+import { recognize as glyphRecognize, setGlyphModel } from './glyph.js'
+import glyphModel from './glyphs.json'
 
 export const OCR_PARAMS = {
   // 원본 좌표 기준. 이보다 작으면 OCR 시도 안 함 (4K 벽 전체 거리에서 라벨 폭 ≈ 51~54px, 사람 눈으로 판독 가능)
@@ -32,9 +34,14 @@ export async function setPanels(letters) {
   const next = [...new Set(letters.length ? letters : ['A', 'B', 'C', 'D'])].sort().join('')
   if (next === panelLetters) return
   panelLetters = next
-  await initOcr()
-  await Promise.all(workers.map((w) => w.setParameters({ tessedit_char_whitelist: panelLetters + '0123456789-' })))
+  // tesseract는 필요할 때만 켜므로, 이미 켜져 있을 때만 허용 글자 갱신
+  if (workers.length)
+    await Promise.all(workers.map((w) => w.setParameters({ tessedit_char_whitelist: panelLetters + '0123456789-' })))
 }
+
+// ── 기본 인식기: 이 라벨 전용 글자 인식기 (라벨당 약 1ms). tesseract(라벨당 수백 ms)는 보조 ──
+setGlyphModel(glyphModel)
+export const OCR_ENGINE = 'glyph'
 
 // 작업자 수: 코어 절반(2~4개). 메모리 4GB 이하 기기(예: 갤럭시탭 A9)는 2개로 제한해 멈춤·튕김 방지
 const defaultWorkers = () => {
@@ -114,28 +121,33 @@ function makeCrop(src, box, p) {
   return c
 }
 
+const toRead = (text, conf, p) => {
+  const m = parseLabel(text)
+  const ok = m && conf >= p.minConf
+  return { text, conf, panel: ok ? m.panel : null, row: ok ? m.row : null, col: ok ? m.col : null }
+}
+
 /**
- * 폭이 충분한 라벨만 OCR. 형식·신뢰도 통과한 것만 row/col 부여
+ * 폭이 충분한 라벨만 인식 (기본: 전용 글자 인식기, 동기 처리라 크롭 시점 문제 없음)
  * @returns {Promise<Array<{text:string,conf:number,row:number|null,col:number|null}|null>>}
  */
 export async function readLabels(src, boxes, p = OCR_PARAMS) {
+  return boxes.map((b) => {
+    if (b.w < p.minLabelW) return null
+    const r = glyphRecognize(src, b)
+    return r ? toRead(r.text, r.conf, p) : null
+  })
+}
+
+/** 보조: tesseract로 인식 (전용 인식기로 위치를 못 잡았을 때만. 처음 호출 시 엔진을 내려받음) */
+export async function readLabelsTesseract(src, boxes, p = OCR_PARAMS) {
   await initOcr()
   return Promise.all(
     boxes.map(async (b) => {
       if (b.w < p.minLabelW) return null
       const crop = makeCrop(src, b, p)
       const { data } = await scheduler.addJob('recognize', crop)
-      const text = (data.text || '').replace(/\s+/g, '')
-      const conf = data.confidence
-      const m = parseLabel(text)
-      const ok = m && conf >= p.minConf
-      return {
-        text,
-        conf,
-        panel: ok ? m.panel : null,
-        row: ok ? m.row : null,
-        col: ok ? m.col : null,
-      }
+      return toRead((data.text || '').replace(/\s+/g, ''), data.confidence, p)
     }),
   )
 }
