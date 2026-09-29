@@ -172,6 +172,7 @@ export default function App() {
   const autoConfirmRef = useRef(false) // 시연 녹화 시 개수 창 없이 자동 기록
   const [busy, setBusy] = useState(false)
   const [resolution, setResolution] = useState(loadRes())
+  const [camRes, setCamRes] = useState('') // 카메라가 실제로 켜진 해상도 (기기가 지원 안 하면 요청보다 낮음)
   const changeResolution = (k) => {
     setResolution(k)
     try {
@@ -281,6 +282,12 @@ export default function App() {
   const trackStep = async (frame, extra = {}) => {
     const tr = trackRef.current
     const res = trackFrame(frame, tr.grid)
+    // 느린 기기: 추적 1프레임이 평균 0.1초를 넘으면 검출 해상도를 낮춤 (960 → 720 → 560)
+    tr.avgMs = tr.avgMs ? tr.avgMs * 0.8 + res.ms * 0.2 : res.ms
+    if (tr.avgMs > 100 && TRACK_PARAMS.procWidth > 560) {
+      TRACK_PARAMS.procWidth = TRACK_PARAMS.procWidth > 720 ? 720 : 560
+      tr.avgMs = 0
+    }
     // 흔들림 감지: 검출 라벨 수가 평소의 60% 밑으로 떨어진 프레임이 연속되면 번호가 밀렸을 수 있음 → 위치 잃음
     const blurry = tr.avgBoxes > 0 && res.nBoxes < tr.avgBoxes * 0.6
     tr.blur = blurry ? (tr.blur || 0) + 1 : 0
@@ -677,6 +684,7 @@ export default function App() {
       setMode('camera')
       trackRef.current = { grid: null, lost: 0, lastVerify: 0, verifying: false, avgBoxes: 0, blur: 0 }
       setMsg(`카메라 ${v.videoWidth}×${v.videoHeight} — 📷 사진을 찍어 위치를 잡아 주세요`)
+      setCamRes(`${v.videoWidth}×${v.videoHeight}`)
       const token = ++runRef.current.token
       setRunning(true)
       while (token === runRef.current.token) {
@@ -776,6 +784,7 @@ export default function App() {
             <option key={k} value={k}>{r.label}</option>
           ))}
         </select>
+        {mode === 'camera' && camRes && <span className="muted">{camRes}</span>}
         <span className="msg">{msg}</span>
       </div>
 

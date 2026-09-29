@@ -36,7 +36,13 @@ export async function setPanels(letters) {
   await Promise.all(workers.map((w) => w.setParameters({ tessedit_char_whitelist: panelLetters + '0123456789-' })))
 }
 
-export function initOcr(nWorkers = Math.min(4, Math.max(2, (navigator.hardwareConcurrency || 4) >> 1))) {
+// 작업자 수: 코어 절반(2~4개). 메모리 4GB 이하 기기(예: 갤럭시탭 A9)는 2개로 제한해 멈춤·튕김 방지
+const defaultWorkers = () => {
+  const byCores = Math.min(4, Math.max(2, (navigator.hardwareConcurrency || 4) >> 1))
+  return navigator.deviceMemory && navigator.deviceMemory <= 4 ? 2 : byCores
+}
+
+export function initOcr(nWorkers = defaultWorkers()) {
   if (readyPromise) return readyPromise
   readyPromise = (async () => {
     scheduler = createScheduler()
